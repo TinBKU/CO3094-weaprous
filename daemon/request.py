@@ -75,7 +75,7 @@ class Request():
             if path == '/':
                 path = '/index.html'
         except Exception:
-            return None, None
+            return None, None, None # Sửa: Luôn trả về 3 giá trị để tránh lỗi unpacking
 
         return method, path, version
              
@@ -92,18 +92,26 @@ class Request():
     def prepare(self, request, routes=None):
         """Prepares the entire request with the given parameters."""
 
-        # Prepare the request line from the request header
-        self.method, self.path, self.version = self.extract_request_line(request)
+    # -------------------------------------------------------------------------- #
+        # Tách Header và Body 
+        try:
+            header_part, self.body = request.split('\r\n\r\n', 1)
+        except ValueError:
+            # Nếu không có body (ví dụ: request GET), request chỉ là header
+            header_part = request
+            self.body = ""
+    # -------------------------------------------------------------------------- #
+
+        # Prepare the request line (chỉ parse từ header_part)
+        self.method, self.path, self.version = self.extract_request_line(header_part)
         print("[Request] {} path {} version {}".format(self.method, self.path, self.version))
 
         #
         # @bksysnet Preapring the webapp hook with WeApRous instance
-        # The default behaviour with HTTP server is empty routed
-        #
-        # TODO manage the webapp hook in this mounting point
+        # ...
         #
         
-        if not routes == {}:
+        if routes is not None and routes != {}:
             self.routes = routes
             self.hook = routes.get((self.method, self.path))
             #
@@ -111,12 +119,26 @@ class Request():
             # ...
             #
 
-        self.headers = self.prepare_headers(request)
+        # Parse headers (chỉ parse từ header_part)
+        self.headers = self.prepare_headers(header_part)
         cookies = self.headers.get('cookie', '')
-            #
-            #  TODO: implement the cookie function here
-            #        by parsing the header            #
-
+        
+    # -------------------------------------------------------------------------- #      
+        # logic parse cookies from header
+        self.cookies = CaseInsensitiveDict()
+        if cookies:
+            try:
+                # Phân tích chuỗi cookie (ví dụ: "auth=true; session=abc")
+                pairs = [p.strip() for p in cookies.split(';')]
+                for pair in pairs:
+                    if '=' in pair:
+                        key, value = pair.split('=', 1)
+                        # Lưu cookie vào self.cookies
+                        self.cookies[key.strip()] = value.strip()
+            except Exception as e:
+                print(f"[Request] Error parsing cookie string: {e}")
+    # -------------------------------------------------------------------------- #
+    
         return
 
     def prepare_body(self, data, files, json=None):
@@ -125,25 +147,56 @@ class Request():
         #
         # TODO prepare the request authentication
         #
-	# self.auth = ...
+    # self.auth = ...
         return
 
 
     def prepare_content_length(self, body):
-        self.headers["Content-Length"] = "0"
-        #
-        # TODO prepare the request authentication
-        #
-	# self.auth = ...
+        # self.headers["Content-Length"] = "0"
+        
+    # -------------------------------------------------------------------------- #
+        if body is not None:
+            self.headers["Content-Length"] = str(len(body))
+        else:
+             self.headers["Content-Length"] = "0"
         return
-
+    # -------------------------------------------------------------------------- #
 
     def prepare_auth(self, auth, url=""):
         #
         # TODO prepare the request authentication
         #
-	# self.auth = ...
+    # self.auth = ...
         return
 
     def prepare_cookies(self, cookies):
             self.headers["Cookie"] = cookies
+
+    # -------------------------------------------------------------------------- #
+    # Thêm property để parse Form Data
+    @property
+    def form_data(self):
+        """
+        Parses 'application/x-www-form-urlencoded' body.
+        Trả về một dictionary.
+        """
+        # Chỉ parse nếu body tồn tại và Content-Type là 'application/x-www-form-urlencoded'
+        if not self.body or self.headers.get('content-type') != 'application/x-www-form-urlencoded':
+            return {}
+        
+        data = {}
+        try:
+            # Dùng thư viện chuẩn của Python để parse
+            from urllib.parse import unquote
+            
+            pairs = self.body.split('&')
+            for pair in pairs:
+                if '=' in pair:
+                    key, val = pair.split('=', 1)
+                    # unquote() để xử lý các ký tự đặc biệt như 'admin%40test.com'
+                    data[unquote(key)] = unquote(val)
+        except Exception as e:
+            print(f"[Request] Lỗi khi parse form data: {e}")
+            
+        return data
+    # -------------------------------------------------------------------------- #

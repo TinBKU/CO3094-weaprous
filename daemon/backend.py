@@ -14,25 +14,24 @@
 daemon.backend
 ~~~~~~~~~~~~~~~~~
 
-This module provides a backend object to manage and persist backend daemon. 
-It implements a basic backend server using Python's socket and threading libraries.
-It supports handling multiple client connections concurrently and routing requests using a
-custom HTTP adapter.
+Mô-đun này cung cấp một đối tượng backend để quản lý và duy trì daemon backend.
+Nó triển khai một máy chủ backend cơ bản bằng cách sử dụng các thư viện socket và threading của Python.
+Nó hỗ trợ xử lý nhiều kết nối máy khách đồng thời và định tuyến các yêu cầu bằng bộ điều hợp HTTP tùy chỉnh.
 
-Requirements:
+Yêu cầu:
 --------------
-- socket: provide socket networking interface.
-- threading: Enables concurrent client handling via threads.
-- response: response utilities.
-- httpadapter: the class for handling HTTP requests.
-- CaseInsensitiveDict: provides dictionary for managing headers or routes.
+- socket: cung cấp giao diện mạng socket.
+- threading: Cho phép xử lý máy khách đồng thời thông qua các luồng.
+- response: các tiện ích phản hồi.
+- httpadapter: lớp để xử lý các yêu cầu HTTP.
+- CaseInsensitiveDict: cung cấp từ điển để quản lý tiêu đề hoặc tuyến đường.
 
 
 Notes:
 ------
-- The server create daemon threads for client handling.
-- The current implementation error handling is minimal, socket errors are printed to the console.
-- The actual request processing is delegated to the HttpAdapter class.
+- Máy chủ tạo các luồng daemon để xử lý máy khách.
+- Việc xử lý lỗi triển khai hiện tại là tối thiểu, các lỗi socket được in ra bảng điều khiển.
+- Việc xử lý yêu cầu thực tế được ủy quyền cho Lớp HttpAdapter.
 
 Usage Example:
 --------------
@@ -85,11 +84,21 @@ def run_backend(ip, port, routes):
 
         while True:
             conn, addr = server.accept()
-            #
-            #  TODO: implement the step of the client incomping connection
-            #        using multi-thread programming with the
-            #        provided handle_client routine
-            #
+            
+            #  TODO: triển khai bước kết nối đến máy khách 
+            #  sử dụng lập trình đa luồng (multi-thread programming) với trình xử lý handle_client được cung cấp
+            
+        # -------------------------------------------------------------------------- #
+            # Tạo một luồng mới để xử lý client này
+            # target=handle_client chỉ định hàm sẽ chạy trong luồng mới
+            # args=(...) là các tham số truyền cho hàm handle_client
+            # .daemon = True cho phép chương trình chính thoát 
+            # ngay cả khi luồng này vẫn đang chạy
+            client_thread = threading.Thread(target=handle_client, args=(ip, port, conn, addr, routes))
+            client_thread.daemon = True 
+            client_thread.start() # Bắt đầu luồng
+        # -------------------------------------------------------------------------- #
+            
     except socket.error as e:
       print("Socket error: {}".format(e))
 

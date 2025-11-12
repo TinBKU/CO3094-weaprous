@@ -93,6 +93,8 @@ class HttpAdapter:
         :param routes (dict): The route mapping for dispatching requests.
         """
 
+        # --- BẮT ĐẦU SỬA: THAY THẾ TOÀN BỘ HÀM ---
+        
         # Connection handler.
         self.conn = conn        
         # Connection address.
@@ -103,10 +105,97 @@ class HttpAdapter:
         resp = self.response
 
         # Handle the request
-        msg = conn.recv(1024).decode()
-        req.prepare(msg, routes)
+        try:
+            msg = conn.recv(1024).decode()
+            if not msg:
+                print(f"[HttpAdapter] Client {addr} ngắt kết nối.")
+                conn.close()
+                return
+        except Exception as e:
+            print(f"[HttpAdapter] Lỗi khi nhận dữ liệu: {e}")
+            conn.close()
+            return
+            
+        # Parse request (đã sửa ở Bước 2)
+        try:
+             req.prepare(msg, routes)
+        except Exception as e:
+             print(f"[HttpAdapter] Lỗi khi parse request: {e}")
+             # Gửi lỗi 400 Bad Request
+             response_data = (
+                "HTTP/1.1 400 Bad Request\r\n"
+                "Content-Length: 15\r\nConnection: close\r\n\r\n"
+                "400 Bad Request"
+             ).encode('utf-8')
+             conn.sendall(response_data)
+             conn.close()
+             return
 
-        # Handle request hook
+        # XỬ LÝ AUTHENTICATION (POST /login) 
+        if req.method == 'POST' and req.path == '/login':
+            
+            # Lấy form data đã được parse
+            form = req.form_data
+            username = form.get('username')
+            password = form.get('password')
+
+            if username == 'admin' and password == 'password':
+                # --- ĐĂNG NHẬP THÀNH CÔNG (ĐÃ SỬA) ---
+                print(f"[Auth] Đăng nhập thành công, gửi 302 Redirect cho: {username} từ {addr}")
+                
+                # 1. Xây dựng response 302 Found (Redirect)
+                # Yêu cầu trình duyệt tự chuyển đến /index.html
+                body = "Redirecting to /index.html"
+                response_data = (
+                    f"HTTP/1.1 302 Found\r\n"
+                    f"Location: /index.html\r\n"
+                    f"Set-Cookie: auth=true; Path=/; HttpOnly\r\n" # Gửi cookie cùng lúc
+                    f"Content-Type: text/plain\r\n"
+                    f"Content-Length: {len(body)}\r\n"
+                    f"Connection: close\r\n"
+                    f"\r\n"
+                    f"{body}"
+                ).encode('utf-8')
+
+                # 2. Gửi response và đóng kết nối
+                conn.sendall(response_data)
+                conn.close()
+                return # Quan trọng: Kết thúc xử lý tại đây
+                
+            else:
+                # --- ĐĂNG NHẬP THẤT BẠI ---
+                print(f"[Auth] Đăng nhập thất bại cho: {username} từ {addr}")
+                
+                # 1. Gửi response 401 (sử dụng hàm mới từ Bước 3.3)
+                response_data = resp.build_unauthorized()
+                conn.sendall(response_data)
+                conn.close()
+                return # Kết thúc xử lý
+        
+        # XỬ LÝ ACCESS CONTROL (GET /index.html) 
+        
+        # Các trang cần bảo vệ
+        protected_paths = ['/index.html'] 
+        
+        if req.method == 'GET' and req.path in protected_paths:
+            
+            # Lấy cookie đã được parse
+            auth_cookie = req.cookies.get('auth')
+            
+            if auth_cookie == 'true':
+                # --- ĐÃ XÁC THỰC ---
+                print(f"[Auth] Client {addr} đã xác thực, cho phép truy cập.")
+                # Để code chạy tiếp xuống phần build_response
+            else:
+                # --- CHƯA XÁC THỰC ---
+                print(f"[Auth] Client {addr} truy cập bị từ chối. Yêu cầu đăng nhập.")
+                
+                # 1. Gửi response 401
+                response_data = resp.build_unauthorized()
+                conn.sendall(response_data)
+                conn.close()
+                return # Kết thúc xử lý
+
         if req.hook:
             print("[HttpAdapter] hook in route-path METHOD {} PATH {}".format(req.hook._route_path,req.hook._route_methods))
             req.hook(headers = "bksysnet",body = "get in touch")
@@ -114,12 +203,12 @@ class HttpAdapter:
             # TODO: handle for App hook here
             #
 
-        # Build response
+
         response = resp.build_response(req)
 
-        #print(response)
         conn.sendall(response)
         conn.close()
+
 
     @property
     def extract_cookies(self, req, resp):
@@ -130,14 +219,8 @@ class HttpAdapter:
         :param resp: (Response) The res:class:`Response <Response>` object.
         :rtype: cookies - A dictionary of cookie key-value pairs.
         """
-        cookies = {}
-        for header in headers:
-            if header.startswith("Cookie:"):
-                cookie_str = header.split(":", 1)[1].strip()
-                for pair in cookie_str.split(";"):
-                    key, value = pair.strip().split("=")
-                    cookies[key] = value
-        return cookies
+        
+        return req.cookies
 
     def build_response(self, req, resp):
         """Builds a :class:`Response <Response>` object 
@@ -149,9 +232,11 @@ class HttpAdapter:
         response = Response()
 
         # Set encoding.
-        response.encoding = get_encoding_from_headers(response.headers)
+        # response.encoding = get_encoding_from_headers(response.headers)
+        response.encoding = 'utf-8' # Mặc định
         response.raw = resp
-        response.reason = response.raw.reason
+        
+        # response.reason = response.raw.reason 
 
         if isinstance(req.url, bytes):
             response.url = req.url.decode("utf-8")
@@ -159,7 +244,8 @@ class HttpAdapter:
             response.url = req.url
 
         # Add new cookies from the server.
-        response.cookies = extract_cookies(req)
+        # response.cookies = extract_cookies(req)
+        pass
 
         # Give the Response some context.
         response.request = req

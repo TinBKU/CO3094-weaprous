@@ -159,13 +159,19 @@ class Response():
             elif sub_type == 'html':
                 base_dir = BASE_DIR+"www/"
             else:
-                handle_text_other(sub_type)
+                # handle_text_other(sub_type)
+                base_dir = BASE_DIR+"static/" # Mặc định cho text khác
         elif main_type == 'image':
             base_dir = BASE_DIR+"static/"
             self.headers['Content-Type']='image/{}'.format(sub_type)
         elif main_type == 'application':
-            base_dir = BASE_DIR+"apps/"
-            self.headers['Content-Type']='application/{}'.format(sub_type)
+            # Sửa: Mặc định cho JS
+            if sub_type == 'javascript' or sub_type == 'x-javascript':
+                base_dir = BASE_DIR+"static/"
+                self.headers['Content-Type'] = 'application/javascript'
+            else:
+                base_dir = BASE_DIR+"apps/"
+                self.headers['Content-Type']='application/{}'.format(sub_type)
         #
         #  TODO: process other mime_type
         #        application/xml       
@@ -179,7 +185,11 @@ class Response():
         #        ...
         #
         else:
-            raise ValueError("Invalid MEME type: main_type={} sub_type={}".format(main_type,sub_type))
+            # raise ValueError("Invalid MEME type: main_type={} sub_type={}".format(main_type,sub_type))
+            print("[Response] MIME type không xác định: {}. Mặc định là 'static/'".format(mime_type))
+            base_dir = BASE_DIR+"static/"
+            self.headers['Content-Type'] = mime_type
+
 
         return base_dir
 
@@ -201,7 +211,21 @@ class Response():
             #  TODO: implement the step of fetch the object file
             #        store in the return value of content
             #
-        return len(content), content
+        
+    # -------------------------------------------------------------------------- #
+        try:
+            # 'rb' = read binary (quan trọng cho ảnh, file, v.v.)
+            with open(filepath, 'rb') as f:
+                content = f.read()
+            return len(content), content
+        except FileNotFoundError:
+            print(f"[Response] Lỗi: Không tìm thấy file {filepath}")
+            # Trả về 0 và content rỗng, logic ở httpadapter sẽ xử lý 404
+            return 0, b"" 
+        except Exception as e:
+            print(f"[Response] Lỗi khi đọc file: {e}")
+            return 0, b""
+    # -------------------------------------------------------------------------- #
 
 
     def build_response_header(self, request):
@@ -213,6 +237,14 @@ class Response():
 
         :rtypes bytes: encoded HTTP response header.
         """
+        
+    # -------------------------------------------------------------------------- #
+        # Gán giá trị mặc định nếu chưa có
+        if not self.status_code:
+            self.status_code = 200
+            self.reason = "OK"
+    # -------------------------------------------------------------------------- #
+        
         reqhdr = request.headers
         rsphdr = self.headers
 
@@ -224,7 +256,7 @@ class Response():
                 "Cache-Control": "no-cache",
                 "Content-Type": "{}".format(self.headers['Content-Type']),
                 "Content-Length": "{}".format(len(self._content)),
-#                "Cookie": "{}".format(reqhdr.get("Cookie", "sessionid=xyz789")), #dummy cooki
+                # "Cookie": "{}".format(reqhdr.get("Cookie", "sessionid=xyz789")), #dummy cooki
         #
         # TODO prepare the request authentication
         #
@@ -235,6 +267,7 @@ class Response():
                 "Proxy-Authorization": "Basic dXNlcjpwYXNz",  # example base64
                 "Warning": "199 Miscellaneous warning",
                 "User-Agent": "{}".format(reqhdr.get("User-Agent", "Chrome/123.0.0.0")),
+                "Connection": "close", # Thêm: Đóng kết nối sau mỗi response
             }
 
         # Header text alignment
@@ -242,11 +275,26 @@ class Response():
             #  TODO: implement the header building to create formated
             #        header from the provied headers
             #
-        #
-        # TODO prepare the request authentication
-        #
-	# self.auth = ...
+        
+    # -------------------------------------------------------------------------- #
+        # Bắt đầu với dòng status
+        fmt_header = f"HTTP/1.1 {self.status_code} {self.reason}\r\n"
+        
+        # Thêm tất cả header động
+        for key, value in headers.items():
+            fmt_header += f"{key}: {value}\r\n"
+            
+        # Thêm các header đã được set thủ công (ví dụ: Set-Cookie)
+        # Ghi đè các header động nếu trùng key
+        for key, value in self.headers.items():
+            if key not in headers: 
+                fmt_header += f"{key}: {value}\r\n"
+
+        # Dòng trống cuối cùng để ngăn cách header và body
+        fmt_header += "\r\n"
+        
         return str(fmt_header).encode('utf-8')
+    # -------------------------------------------------------------------------- #
 
 
     def build_notfound(self):
@@ -255,17 +303,47 @@ class Response():
 
         :rtype bytes: Encoded 404 response.
         """
-
+        
+        # Thêm status_code và reason
+        self.status_code = 404
+        self.reason = "Not Found"
+        
+        body = "404 Not Found"
         return (
-                "HTTP/1.1 404 Not Found\r\n"
-                "Accept-Ranges: bytes\r\n"
-                "Content-Type: text/html\r\n"
-                "Content-Length: 13\r\n"
-                "Cache-Control: max-age=86000\r\n"
-                "Connection: close\r\n"
-                "\r\n"
-                "404 Not Found"
-            ).encode('utf-8')
+            f"HTTP/1.1 {self.status_code} {self.reason}\r\n"
+            f"Content-Type: text/html\r\n"
+            f"Content-Length: {len(body)}\r\n"
+            f"Connection: close\r\n"
+            f"\r\n"
+            f"{body}"
+        ).encode('utf-8')
+
+
+    # THÊM HÀM set_header và build_unauthorized 
+    def set_header(self, key, value):
+        """
+        Thêm hoặc cập nhật một header cho response.
+        Chúng ta sẽ dùng cái này cho 'Set-Cookie'.
+        """
+        self.headers[key] = value
+
+    def build_unauthorized(self):
+        """
+        Constructs a standard 401 Unauthorized HTTP response.
+        """
+        # Thêm status_code và reason
+        self.status_code = 401
+        self.reason = "Unauthorized"
+        
+        body = "401 Unauthorized"
+        return (
+            f"HTTP/1.1 {self.status_code} {self.reason}\r\n"
+            f"Content-Type: text/html\r\n"
+            f"Content-Length: {len(body)}\r\n"
+            f"Connection: close\r\n"
+            f"\r\n"
+            f"{body}"
+        ).encode('utf-8')
 
 
     def build_response(self, request):
@@ -276,6 +354,12 @@ class Response():
 
         :rtype bytes: complete HTTP response using prepared headers and content.
         """
+    # -------------------------------------------------------------------------- #
+        # Xử lý request rỗng ---
+        if not request.method or not request.path:
+             print("[Response] Request không hợp lệ.")
+             return self.build_notfound() # Hoặc một lỗi 400 Bad Request
+    # -------------------------------------------------------------------------- #
 
         path = request.path
 
@@ -289,13 +373,31 @@ class Response():
             base_dir = self.prepare_content_type(mime_type = 'text/html')
         elif mime_type == 'text/css':
             base_dir = self.prepare_content_type(mime_type = 'text/css')
-        #
+        
         # TODO: add support objects
-        #
+        
+    # -------------------------------------------------------------------------- #
+        # Thêm các object khác ---
+        elif mime_type.startswith('image/'):
+            base_dir = self.prepare_content_type(mime_type = mime_type)
+        elif mime_type == 'application/javascript' or mime_type == 'application/x-javascript':
+             base_dir = self.prepare_content_type(mime_type = 'application/javascript')
+    # -------------------------------------------------------------------------- #
+    
         else:
-            return self.build_notfound()
+        # -------------------------------------------------------------------------- #
+            # return self.build_notfound() 
+            # Thử tìm file trong static
+            print(f"[Response] Thử tìm {path} trong 'static/'")
+            base_dir = self.prepare_content_type(mime_type = mime_type)
 
         c_len, self._content = self.build_content(path, base_dir)
+        
+        # Trả về 404 nếu không tìm thấy file ---
+        if c_len == 0 and not self._content:
+            return self.build_notfound()
+        # -------------------------------------------------------------------------- #
+
         self._header = self.build_response_header(request)
 
         return self._header + self._content
