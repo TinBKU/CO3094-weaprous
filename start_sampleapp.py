@@ -35,17 +35,45 @@ PORT = 8000  # Default port
 app = WeApRous()
 
 @app.route('/login', methods=['POST'])
-def login(headers="guest", body="anonymous"):
+def handle_login(request, response):
     """
-    Handle user login via POST request.
-
-    This route simulates a login process and prints the provided headers and body
-    to the console.
-
-    :param headers (str): The request headers or user identifier.
-    :param body (str): The request body or login payload.
+    Xử lý POST /login.
+    Hàm này được gọi từ httpadapter.py (thay vì code hardcode).
+    Nó nhận vào 2 đối tượng: request và response.
     """
-    print "[SampleApp] Logging in {} to {}".format(headers, body)
+    print(f"[WeApRous] Handling POST /login...")
+    
+    # 1. Lấy dữ liệu (hỗ trợ cả JSON (raw) và Form)
+    data = request.json_data  # Thử parse JSON (raw) trước
+    if not data:
+        data = request.form_data # Nếu không có JSON, thử parse form-urlencoded
+        
+    username = data.get('username')
+    password = data.get('password')
+    
+    print(f"[WeApRous] Login attempt: user={username}")
+
+    # 2. Kiểm tra logic
+    if username == 'admin' and password == 'password':
+        print(f"[WeApRous] Login Succeeded. Setting cookie and redirecting.")
+        #Đăng nhập thành công: Set Cookie và Redirect
+        
+        # Gán request vào response để hàm build_redirect có thể đọc
+        response.request = request 
+        
+        # Set cookie vào response
+        response.set_header('Set-Cookie', 'auth=true; Path=/; HttpOnly')
+        
+        # Trả về response 302
+        return response.build_redirect('/index.html')
+    else:
+        print(f"[WeApRous] Login Failed. Returning 401.")
+        # Đăng nhập thất bại: Trả về 401
+        
+        # Gán request vào response
+        response.request = request 
+        
+        return response.build_unauthorized()
 
 @app.route('/hello', methods=['PUT'])
 def hello(headers, body):
