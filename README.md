@@ -36,17 +36,7 @@ Task 2:
 Peer A ↔ Peer B (TCP)
 Peer → Tracker (REST)
 
-## 4. Project Structure
-/
-├── start_proxy.py
-├── start_backend.py
-├── start_sampleapp.py
-├── peer_client_fixed.py
-├── daemon/weaprous/
-├── static/
-└── README.md
-
-## 5. Running Instructions
+## 4. Running Instructions
 
 ### Task 1 – HTTP Login System
 
@@ -69,7 +59,7 @@ python peer_client.py --peer-id P1 --host 127.0.0.1 --port 5001
 #### Start Peer 2
 python peer_client.py --peer-id P2 --host 127.0.0.1 --port 5002
 
-## 6. Example Commands (in peer REPL)
+## 5. Example Commands (in peer REPL)
 > peers  
 > send P2 hello  
 > broadcast hi-all  
@@ -77,12 +67,12 @@ python peer_client.py --peer-id P2 --host 127.0.0.1 --port 5002
 > join room1  
 > sendchan room1 hello-channel  
 
-## 7. Common Errors
+## 6. Common Errors
 - Address already in use → change port.
 - Peer unreachable → firewall/NAT.
 - TTL expired → auto re-register.
 
-## 8. Conclusion
+## 7. Conclusion
 All requirements for Assignment 1 are completed including:
 - Cookie-based HTTP auth
 - Reverse proxy + backend separation
