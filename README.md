@@ -89,3 +89,10 @@ All requirements for Assignment 1 are completed including:
 - RESTful tracker
 - Direct P2P + fallback relay
 - Channels + broadcast
+
+## ⚙️ Python Version Requirement
+Project tested and verified using:
+Ensure your environment uses:
+```bash
+python --version
+# Python 3.14.0 (recommended)
