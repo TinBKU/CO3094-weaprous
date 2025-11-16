@@ -408,7 +408,23 @@ class HttpAdapter:
             
         # Parse request 
         try:
-             req.prepare(msg, routes)
+            req.prepare(msg, routes)
+            # --- CORS PREFLIGHT HANDLER ---
+            if req.method == "OPTIONS":
+                # Gửi header CORS
+                cors_headers = (
+                    "HTTP/1.1 204 No Content\r\n"
+                    "Access-Control-Allow-Origin: *\r\n"
+                    "Access-Control-Allow-Methods: GET, POST, PUT, DELETE, OPTIONS\r\n"
+                    "Access-Control-Allow-Headers: Content-Type, Authorization\r\n"
+                    "Access-Control-Max-Age: 86400\r\n"
+                    "Connection: close\r\n"
+                    "\r\n"
+                ).encode('utf-8')
+
+                conn.sendall(cors_headers)
+                conn.close()
+                return
         except Exception as e:
              print(f"[HttpAdapter] Lỗi khi parse request: {e}")
              response_data = (
