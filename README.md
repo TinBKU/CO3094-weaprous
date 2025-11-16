@@ -50,32 +50,28 @@ Access: http://127.0.0.1:8000/login.html
 
 ### Task 2 – Hybrid Chat Application
 
-#### Start Tracker
-python start_sampleapp.py --server-ip 127.0.0.1 --server-port 8000
+#### 1.Start Backend 
+python start_sampleapp.py 
 
-#### Start Peer 1
-python peer_client.py --peer-id P1 --host 127.0.0.1 --port 5001
+#### 2.Start Tracker
+python tracker_server.py 
 
-#### Start Peer 2
-python peer_client.py --peer-id P2 --host 127.0.0.1 --port 5002
+#### 3.Start Peer 1
+python peer_client.py --id admin --host 127.0.0.1 --port 10001 --ws-port 7000 --auth-mode soft
 
-## 5. Example Commands (in peer REPL)
-> peers  
-> send P2 hello  
-> broadcast hi-all  
-> create room1  
-> join room1  
-> sendchan room1 hello-channel  
 
-## 6. Common Errors
+#### 4.Start Peer 2
+python peer_client.py --id user --host 127.0.0.1 --port 10002 --ws-port 7002 --auth-mode soft
+
+
+## 5. Common Errors
 - Address already in use → change port.
 - Peer unreachable → firewall/NAT.
 - TTL expired → auto re-register.
 
-## 7. Conclusion
+## 6. Conclusion
 All requirements for Assignment 1 are completed including:
 - Cookie-based HTTP auth
-- Reverse proxy + backend separation
 - RESTful tracker
 - Direct P2P + fallback relay
 - Channels + broadcast
