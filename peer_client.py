@@ -1,424 +1,684 @@
 #!/usr/bin/env python3
 """
-peer_client.py — Peer client with P2P-first send + tracker-relay fallback.
+peer_web.py - Hybrid P2P Chat + Web UI Bridge (CO3094 style)
 
-Behavior:
-- Register with tracker via POST /submit-info
-- Periodically re-register to refresh TTL
-- Fetch peer list from tracker via GET /get-list
-- When sending to a peer:
-    1) Try cached address and direct TCP connect
-    2) If missing or direct connect fails, call tracker /connect-peer (mode=info) to get target address
-    3) If still fails, call tracker /send-peer to ask tracker to relay (short-lived)
-- Listener expects line-delimited JSON messages
-- REPL supports: peers, refresh, send, broadcast, create, join, channels, sendchan, exit
+- P2P TCP message exchange between peers
+- Tracker REST integration (register / list peers)
+- WebSocket bridge từ browser <-> peer
+- Middleware: có thể kiểm tra session cookie qua cookie_http_server /whoami
+- Đăng ký ws_port với cookie_http_server /register_peer_ws
 """
-import argparse
-import http.client
-import json
-import logging
+
+import os
 import socket
 import threading
+import json
 import time
-import urllib.parse
-from typing import Dict, Tuple, Optional
+import argparse
+import requests
+import asyncio
+import websockets
+from http.server import SimpleHTTPRequestHandler, ThreadingHTTPServer
 
-# --- Config
-REGISTER_RETRIES = 5
-FETCH_RETRIES = 3
-REREGISTER_INTERVAL = 60
-HTTP_TIMEOUT = 5
-TCP_CONNECT_TIMEOUT = 4
-REREGISTER_BACKOFF = 5  # seconds before retry immediate failures
+# -----------------------------
+# Config
+# -----------------------------
+TRACKER_URL = "http://127.0.0.1:5000"   # tracker_server.py
+COOKIE_SERVER = "http://127.0.0.1:9000" # cookie_http_server.py
 
-# --- Logging
-logging.basicConfig(level=logging.INFO, format='[%(asctime)s] %(levelname)s %(message)s')
+STATIC_HOST = "0.0.0.0"
+DEFAULT_STATIC_PORT = 8000
+DEFAULT_WS_PORT = 7000
 
 
-class Peer:
-    def __init__(self, peer_id: str, bind_host: str, bind_port: int, tracker_url: str):
-        self.peer_id = peer_id
-        self.bind_host = bind_host
-        # host advertised to tracker (use bind_host unless it's 0.0.0.0)
-        self.advertise_host = '127.0.0.1' if bind_host == '0.0.0.0' else bind_host
-        self.port = int(bind_port)
-        self.tracker_url = tracker_url.rstrip('/')
-        self.peers: Dict[str, Tuple[str, int]] = {}
+def make_msg(channel, peer_id, text):
+    return {
+        "type": "msg",
+        "channel": channel,
+        "from": peer_id,
+        "text": text,
+        "ts": time.time(),
+    }
+
+
+# -----------------------------
+# WebSocket Bridge
+# -----------------------------
+class WebSocketBridge:
+    def __init__(self, ws_port, auth_mode="soft"):
+        """
+        auth_mode:
+          - "strict": bắt buộc gọi /whoami, lỗi là từ chối WebSocket
+          - "soft": cố gắng gọi /whoami, nếu lỗi network thì vẫn cho qua,
+                    nhưng nếu server trả ok=false thì từ chối
+          - "off": bỏ qua hoàn toàn bước /whoami (offline/dev)
+        """
+        self.clients = set()
         self.lock = threading.Lock()
-        self.running = True
-        self._listener_sock = None
+        self.ws_port = ws_port
+        self.peer_ref = None
+        self.auth_mode = auth_mode
 
-    # --- helper for tracker URL parsing + HTTP requests
-    def _parse_tracker(self):
-        parsed = urllib.parse.urlparse(self.tracker_url)
-        scheme = parsed.scheme or 'http'
-        host = parsed.hostname or '127.0.0.1'
-        port = parsed.port or (80 if scheme == 'http' else 443)
-        return scheme, host, port
+        # tạo event loop riêng cho WebSocket server
+        self.loop = asyncio.new_event_loop()
+        threading.Thread(target=self._start_loop, daemon=True).start()
 
-    def _http_request_raw(self, method: str, path: str, body: Optional[bytes] = None, headers: Optional[dict] = None, timeout=HTTP_TIMEOUT):
-        scheme, host, port = self._parse_tracker()
-        conn = http.client.HTTPConnection(host, port, timeout=timeout)
-        try:
-            if headers is None:
-                headers = {}
-            conn.request(method, path, body=body, headers=headers)
-            resp = conn.getresponse()
-            data = resp.read()
-            return resp.status, data
-        finally:
+        # chạy HTTP/websocket server
+        asyncio.run_coroutine_threadsafe(self._start_server(ws_port), self.loop)
+
+    def _start_loop(self):
+        asyncio.set_event_loop(self.loop)
+        self.loop.run_forever()
+
+    async def _start_server(self, ws_port):
+        self.server = await websockets.serve(self._ws_handler, "0.0.0.0", ws_port)
+        print(f"[WS] WebSocket server listening ws://127.0.0.1:{ws_port}/ws")
+
+    async def _ws_handler(self, websocket, path=None):
+        """
+        Handler xử lý client WebSocket kết nối vào backend peer_web.
+        Có middleware kiểm tra session cookie (tùy auth_mode).
+        """
+
+        # -----------------------------------------
+        # Middleware kiểm tra session cookie
+        # -----------------------------------------
+        if self.auth_mode == "off":
+            print("[WS] auth_mode=off, accept all WebSocket connections")
+        else:
+            headers = {}
+            if hasattr(websocket, "request") and websocket.request:
+                headers = websocket.request.headers
+            elif hasattr(websocket, "request_headers"):
+                headers = websocket.request_headers
+
+            cookies = headers.get("Cookie", "")
+            print("[WS] incoming cookies:", cookies)
+
             try:
-                conn.close()
-            except Exception:
-                pass
+                r = requests.get(
+                    f"{COOKIE_SERVER}/whoami",
+                    headers={"Cookie": cookies},
+                    timeout=2,
+                )
+                info = r.json()
 
-    def _http_json(self, method: str, path: str, obj=None, headers=None, timeout=HTTP_TIMEOUT):
-        body = None
-        if obj is not None:
-            body = json.dumps(obj).encode('utf-8')
-            if headers is None:
-                headers = {}
-            headers["Content-Type"] = "application/json"
-        status, data = self._http_request_raw(method, path, body=body, headers=headers, timeout=timeout)
-        decoded = None
-        try:
-            decoded = data.decode('utf-8') if data is not None else ''
-            parsed = json.loads(decoded) if decoded else {}
-        except Exception:
-            parsed = {}
-        return status, parsed, decoded
-
-    # --- register / fetch peers
-    def register_to_tracker(self, retries=REGISTER_RETRIES) -> bool:
-        payload = {"peer_id": self.peer_id, "host": self.advertise_host, "port": self.port}
-        for attempt in range(1, retries + 1):
-            try:
-                status, parsed, raw = self._http_json("POST", "/submit-info", obj=payload)
-                logging.info("[tracker] register attempt %d -> %s", attempt, status)
-                if status in (200, 201):
-                    return True
-            except Exception as e:
-                logging.warning("[tracker] register attempt %d failed: %s", attempt, e)
-            time.sleep(1)
-        logging.error("[tracker] register failed after retries")
-        return False
-
-    def fetch_peers(self, retries=FETCH_RETRIES) -> bool:
-        for attempt in range(1, retries + 1):
-            try:
-                status, parsed, raw = self._http_json("GET", "/get-list")
-                if status == 200:
-                    newmap = {}
-                    for item in parsed.get("peers", []):
-                        pid = item.get("peer_id")
-                        h = item.get("host")
-                        p = int(item.get("port"))
-                        if pid:
-                            newmap[pid] = (h, p)
-                    with self.lock:
-                        self.peers = newmap
-                    logging.info("[tracker] fetch_peers OK: %s", list(self.peers.keys()))
-                    return True
+                if not r.ok or not info.get("ok"):
+                    print("[WS] whoami failed:", r.status_code, info)
+                    if self.auth_mode == "strict":
+                        # strict: backend là bắt buộc
+                        await websocket.close(code=4401, reason="Unauthorized")
+                        return
+                    else:
+                        # soft: chỉ log, vẫn cho qua
+                        print("[WS] auth_mode=soft, allow despite whoami not ok")
                 else:
-                    logging.warning("[tracker] get-list returned %s", status)
+                    print("[WS] whoami ok. user:", info.get("user"))
+
             except Exception as e:
-                logging.warning("[tracker] fetch attempt %d failed: %s", attempt, e)
-            time.sleep(1)
-        logging.error("[tracker] fetch_peers ultimately failed")
-        return False
+                print("[WS] whoami exception:", e)
+                if self.auth_mode == "strict":
+                    await websocket.close(code=4401, reason="Auth error")
+                    return
+                else:
+                    print("[WS] auth_mode=soft, ignore whoami exception")
 
-    # --- re-register loop to refresh TTL (tracker may not have /keepalive)
-    def re_register_loop(self):
-        while self.running:
-            try:
-                ok = self.register_to_tracker(retries=1)
-                if not ok:
-                    logging.info("re-register failed; will retry later")
-                # wait with small sleeps to allow quick shutdown
-                for _ in range(int(REREGISTER_INTERVAL)):
-                    if not self.running:
-                        break
-                    time.sleep(1)
-            except Exception:
-                logging.exception("exception in re_register_loop")
-                time.sleep(REREGISTER_BACKOFF)
+        # -----------------------------------------
+        # Kết nối hợp lệ → client vào danh sách
+        # -----------------------------------------
+        print("[WS] client connected")
+        with self.lock:
+            self.clients.add(websocket)
 
-    # --- Listener (accept JSON-per-line)
-    def start_listener(self):
-        t = threading.Thread(target=self._listener_thread, name="listener", daemon=True)
-        t.start()
+        # Gửi event chào
+        await websocket.send(json.dumps({
+            "type": "connected",
+            "peer_id": self.peer_ref.peer_id
+        }))
 
-    def _listener_thread(self):
-        sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        self._listener_sock = sock
+        # -----------------------------------------
+        # Nhận message từ UI
+        # -----------------------------------------
         try:
-            sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-            sock.bind((self.bind_host, self.port))
-            sock.listen(8)
-            sock.settimeout(1.0)
-            logging.info("Listening on %s:%d", self.bind_host, self.port)
-            while self.running:
+            async for raw in websocket:
                 try:
-                    conn, addr = sock.accept()
-                except socket.timeout:
-                    continue
+                    obj = json.loads(raw)
                 except Exception:
-                    if self.running:
-                        logging.exception("accept error")
-                    break
-                threading.Thread(target=self._handle_conn, args=(conn, addr), daemon=True).start()
-        except Exception:
-            logging.exception("listener error")
-            self.running = False
-        finally:
-            try:
-                sock.close()
-            except Exception:
-                pass
-            self._listener_sock = None
-            logging.info("listener stopped")
+                    continue
 
-    def _handle_conn(self, conn: socket.socket, addr):
-        with conn:
-            try:
-                f = conn.makefile("rb")
-                for raw in f:
-                    if not raw:
-                        break
-                    line = raw.strip()
-                    if not line:
+                cmd = obj.get("cmd")
+                if not cmd:
+                    continue
+
+                # xử lý command
+                if cmd == "broadcast":
+                    if self.peer_ref:
+                        self.peer_ref.broadcast(
+                            obj.get("channel", "general"),
+                            obj.get("text", "")
+                        )
+                    else:
+                        print("[WS] broadcast but peer_ref is None")
                         continue
+
+                elif cmd == "connect":
+                    # dùng tracker: peer_id -> ip, port
+                    pid = obj.get("peer_id")
+                    ok, info = self.peer_ref.connect_to_peer(pid)
+                    await websocket.send(json.dumps({
+                        "type": "connect_result",
+                        "ok": ok,
+                        "info": info,
+                    }))
+
+                elif cmd == "connect_manual":
+                    # offline/manual: ip + port
+                    ip = obj.get("ip")
+                    port = obj.get("port")
                     try:
-                        obj = json.loads(line.decode('utf-8', errors='ignore'))
+                        port = int(port)
                     except Exception:
-                        logging.warning("invalid JSON line from %s: %r", addr, line[:200])
+                        port = None
+
+                    if not ip or port is None:
+                        await websocket.send(json.dumps({
+                            "type": "connect_result",
+                            "ok": False,
+                            "info": "missing ip/port"
+                        }))
+                    else:
+                        ok, info = self.peer_ref.connect_to_addr(ip, port)
+                        await websocket.send(json.dumps({
+                            "type": "connect_result",
+                            "ok": ok,
+                            "info": info,
+                        }))
+
+                elif cmd == "create_room":
+                    room = obj["channel"]
+                    to_peer = obj.get("to_peer")
+
+                    self.peer_ref.join_channel(room)
+                    self.push_event({"type": "joined_channel", "channel": room})
+
+                    if to_peer:
+                        print(f"[WS] create_room -> to_peer={to_peer}")
+                        ok, info = self.peer_ref.send_direct(to_peer, "__meta__", f"join:{room}")
+                        print(f"[WS] send_direct meta join:{room} to {to_peer} -> ok={ok}, info={info}")
+
+                        # fallback: nếu gửi direct fail thì broadcast cho tất cả
+                        if not ok:
+                            print("[WS] send_direct failed, fallback to broadcast __meta__")
+                            self.peer_ref.broadcast("__meta__", f"join:{room}")
+                    else:
+                        self.peer_ref.broadcast("__meta__", f"join:{room}")
+
+
+                elif cmd == "join":
+                    room = obj["channel"]
+                    if room == "__meta__":  # tránh lỗi
                         continue
-                    self._process_msg(obj, addr)
-            except Exception:
-                logging.exception("error handling connection from %s", addr)
 
-    def _process_msg(self, obj: dict, addr):
-        try:
-            mtype = obj.get("type")
-            sender = obj.get("from")
-            payload = obj.get("payload")
-            if mtype == "message":
-                logging.info("[recv] message from %s: %s", sender, payload)
-            elif mtype == "channel-msg":
-                channel = obj.get("channel")
-                logging.info("[recv] channel %s from %s: %s", channel, sender, payload)
-            elif mtype == "connect-probe":
-                logging.info("[recv] connect-probe from %s", sender)
-            else:
-                logging.info("[recv] unknown from %s: %s", sender, obj)
-        except Exception:
-            logging.exception("error processing received message")
+                    self.peer_ref.join_channel(room)
+                    self.push_event({"type": "joined_channel", "channel": room})
 
-    # --- P2P direct send helpers ---
-    def _direct_send(self, host: str, port: int, payload_obj: dict, timeout=TCP_CONNECT_TIMEOUT) -> bool:
-        try:
-            with socket.create_connection((host, int(port)), timeout=timeout) as s:
-                s.sendall((json.dumps(payload_obj) + "\n").encode('utf-8'))
-            return True
-        except Exception as e:
-            logging.debug("direct send to %s:%s failed: %s", host, port, e)
-            return False
+                elif cmd == "list_peers":
+                    self.peer_ref.fetch_peers()
+                    await websocket.send(json.dumps({
+                        "type": "peers",
+                        "peers": self.peer_ref.known_peers
+                    }))
 
-    # --- call tracker to get target info for connect-peer (mode=info) ---
-    def ask_tracker_for_target(self, target_peer_id: str) -> Optional[Tuple[str, int]]:
-        try:
-            payload = {"from": self.peer_id, "to": target_peer_id, "mode": "info"}
-            status, parsed, raw = self._http_json("POST", "/connect-peer", obj=payload)
-            if status == 200 and parsed.get("target"):
-                t = parsed["target"]
-                return t.get("host"), int(t.get("port"))
-            logging.debug("connect-peer info returned %s / %s", status, parsed)
-        except Exception:
-            logging.exception("connect-peer request failed")
-        return None
+                elif cmd == "direct_msg":
+                    to_peer = obj["to_peer"]
+                    text = obj["text"]
+                    ch = obj.get("channel")
+                    ok, info = self.peer_ref.send_direct(to_peer, ch, text)
+                    await websocket.send(json.dumps({
+                        "type": "direct_result",
+                        "ok": ok,
+                        "info": info,
+                    }))
 
-    # --- ask tracker to relay message (POST /send-peer) ---
-    def send_via_tracker_relay(self, to_peer_id: str, message: str) -> bool:
-        try:
-            payload = {"to": to_peer_id, "from": self.peer_id, "message": message}
-            status, parsed, raw = self._http_json("POST", "/send-peer", obj=payload)
-            if status == 200 and parsed.get("ok"):
-                logging.info("tracker relayed message to %s", to_peer_id)
-                return True
-            logging.warning("tracker relay failed: %s %s", status, parsed)
-        except Exception:
-            logging.exception("tracker relay exception")
-        return False
-
-    # --- main send with P2P-first, fallback to tracker ---
-    def send_to_peer(self, peer_id: str, payload: str):
-        # 1) try cached address first
-        with self.lock:
-            entry = self.peers.get(peer_id)
-        if entry:
-            host, port = entry
-            logging.info("trying direct send to cached %s -> %s:%s", peer_id, host, port)
-            ok = self._direct_send(host, port, {"type": "message", "from": self.peer_id, "to": peer_id, "payload": payload, "ts": time.time()})
-            if ok:
-                logging.info("sent direct to %s (cached)", peer_id)
-                return True
-            else:
-                logging.info("direct send to cached address failed, will try tracker info")
-
-        # 2) ask tracker for target info and try direct send
-        target = self.ask_tracker_for_target(peer_id)
-        if target:
-            host, port = target
-            logging.info("trying direct send to tracker-supplied %s -> %s:%s", peer_id, host, port)
-            ok = self._direct_send(host, port, {"type": "message", "from": self.peer_id, "to": peer_id, "payload": payload, "ts": time.time()})
-            if ok:
-                # update cache
-                with self.lock:
-                    self.peers[peer_id] = (host, port)
-                logging.info("sent direct to %s (tracker info)", peer_id)
-                return True
-            else:
-                logging.info("direct send to tracker-supplied address failed")
-
-        # 3) final fallback: ask tracker to relay via /send-peer
-        logging.info("falling back to tracker relay for %s", peer_id)
-        ok = self.send_via_tracker_relay(peer_id, payload)
-        if ok:
-            return True
-
-        logging.error("all send attempts to %s failed", peer_id)
-        return False
-
-    # --- broadcast (attempt direct; if a peer unknown, try fetch then relay) ---
-    def broadcast(self, payload: str):
-        with self.lock:
-            peer_ids = [pid for pid in self.peers.keys() if pid != self.peer_id]
-        for pid in peer_ids:
-            self.send_to_peer(pid, payload)
-
-    # --- channels (create/join/list/sendchan) delegated to tracker endpoints ---
-    def create_channel(self, channel_name: str) -> bool:
-        try:
-            payload = {"channel": channel_name, "owner": self.peer_id}
-            status, parsed, raw = self._http_json("POST", "/create-channel", obj=payload)
-            logging.info("create_channel: %s %s", status, parsed)
-            return status == 201
-        except Exception:
-            logging.exception("create_channel error")
-            return False
-
-    def join_channel(self, channel_name: str) -> bool:
-        try:
-            payload = {"channel": channel_name, "peer_id": self.peer_id}
-            status, parsed, raw = self._http_json("POST", "/join-channel", obj=payload)
-            logging.info("join_channel: %s %s", status, parsed)
-            return status == 200
-        except Exception:
-            logging.exception("join_channel error")
-            return False
-
-    def list_channels(self):
-        try:
-            status, parsed, raw = self._http_json("GET", "/list-channels")
-            if status == 200:
-                return parsed.get("channels", [])
-        except Exception:
-            logging.exception("list_channels error")
-        return []
-
-    def send_channel_msg(self, channel_name: str, message: str):
-        chs = self.list_channels()
-        members = []
-        for ch in chs:
-            if ch.get("name") == channel_name:
-                members = ch.get("members", [])
-                break
-        if not members:
-            logging.warning("channel %s not found or no members", channel_name)
-            return
-        msg = {"type": "channel-msg", "from": self.peer_id, "channel": channel_name, "payload": message, "ts": time.time()}
-        for m in members:
-            if m == self.peer_id:
-                continue
-            self.send_to_peer(m, msg)   # gửi đúng channel message object
-
-    def stop(self):
-        self.running = False
-        try:
-            if self._listener_sock:
-                self._listener_sock.close()
-        except Exception:
+        except websockets.exceptions.ConnectionClosed:
             pass
 
+        finally:
+            print("[WS] client disconnected")
+            with self.lock:
+                self.clients.discard(websocket)
 
-# --- simple REPL ---
-def repl(peer: Peer):
-    print("Commands: peers | refresh | send <peer_id> <message> | broadcast <message>")
-    print("          create <channel> | join <channel> | channels | sendchan <channel> <msg> | exit")
-    while peer.running:
+    # ==========================================================
+    # _broadcast(): gửi đến tất cả client WebSocket
+    # ==========================================================
+    async def _broadcast(self, data: str):
+        """
+        Gửi 1 JSON string đến tất cả client WebSocket đã kết nối.
+        """
+        with self.lock:
+            clients = list(self.clients)
+
+        for ws in clients:
+            try:
+                await ws.send(data)
+            except:
+                # nếu gửi lỗi → remove client
+                with self.lock:
+                    if ws in self.clients:
+                        self.clients.remove(ws)
+
+    # ==========================================================
+    # push_event → schedule _broadcast()
+    # ==========================================================
+    def push_event(self, event_obj):
+        """
+        Đẩy event từ backend peer → UI React qua WebSocket.
+        """
+        data = json.dumps(event_obj)
+        asyncio.run_coroutine_threadsafe(
+            self._broadcast(data),
+            self.loop
+        )
+
+
+# -----------------------------
+# Peer (P2P TCP)
+# -----------------------------
+class Peer:
+    def __init__(self, peer_id, listen_ip, listen_port, ws_bridge):
+        self.peer_id = peer_id
+        self.listen_ip = listen_ip
+        self.listen_port = listen_port
+        self.ws_bridge = ws_bridge
+
+        self.running = True
+        self.connections = {}  # peer_id (hoặc ip:port) -> socket
+        self.conn_lock = threading.Lock()
+
+        self.channels = {"general"}
+        self.current_channel = "general"
+
+        self.known_peers = {}
+
+    # --- Tracker interaction ---
+    def register_with_tracker(self):
         try:
-            cmd = input("> ").strip()
-        except (EOFError, KeyboardInterrupt):
-            break
-        if not cmd:
-            continue
-        parts = cmd.split(" ", 2)
-        cmd0 = parts[0].lower()
-        if cmd0 == "peers":
-            with peer.lock:
-                for pid, (h, p) in peer.peers.items():
-                    print(pid, h, p)
-        elif cmd0 == "refresh":
-            peer.fetch_peers()
-        elif cmd0 == "send" and len(parts) >= 3:
-            peer_id = parts[1]; msg = parts[2]
-            peer.send_to_peer(peer_id, msg)
-        elif cmd0 == "broadcast" and len(parts) >= 2:
-            peer.broadcast(parts[1])
-        elif cmd0 == "create" and len(parts) >= 2:
-            peer.create_channel(parts[1])
-        elif cmd0 == "join" and len(parts) >= 2:
-            peer.join_channel(parts[1])
-        elif cmd0 == "channels":
-            chs = peer.list_channels()
-            for ch in chs:
-                print(ch)
-        elif cmd0 == "sendchan" and len(parts) >= 3:
-            peer.send_channel_msg(parts[1], parts[2])
-        elif cmd0 == "exit":
-            peer.stop()
-            break
-        else:
-            print("Unknown command")
-    print("REPL exiting")
+            requests.put(
+                TRACKER_URL + "/submit-info",
+                json={
+                    "peer_id": self.peer_id,
+                    "ip": self.listen_ip,
+                    "port": self.listen_port,
+                },
+                timeout=2,
+            )
+            print(f"[Tracker] registered {self.peer_id}")
+        except Exception as e:
+            print("[Tracker] register failed:", e)
+
+    def unregister_with_tracker(self):
+        try:
+            requests.delete(
+                TRACKER_URL + "/unregister",
+                json={"peer_id": self.peer_id},
+                timeout=2,
+            )
+        except Exception as e:
+            print("[Tracker] unregister failed:", e)
+
+    def fetch_peers(self):
+        try:
+            res = requests.get(TRACKER_URL + "/get-list", timeout=2).json()
+            peers = res.get("peers", [])
+            self.known_peers = {
+                p["peer_id"]: {"ip": p["ip"], "port": p["port"]}
+                for p in peers
+                if p["peer_id"] != self.peer_id
+            }
+            print("[Peer] known_peers:", self.known_peers)
+        except Exception as e:
+            print("[Tracker] fetch_peers failed:", e)
+
+    # --- TCP server ---
+    def start_server(self):
+        s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        try:
+            s.bind((self.listen_ip, self.listen_port))
+            s.listen(50)
+            self.server_sock = s
+            print(f"[Peer] listening TCP {self.listen_ip}:{self.listen_port}")
+        except Exception as e:
+            print(f"[Peer] failed to bind {self.listen_ip}:{self.listen_port} -> {e}")
+            raise
+        threading.Thread(target=self._accept_loop, daemon=True).start()
+
+    def _accept_loop(self):
+        while self.running:
+            try:
+                conn, _ = self.server_sock.accept()
+                threading.Thread(target=self._peer_handler, args=(conn,), daemon=True).start()
+            except Exception:
+                break
+
+    # --- outbound connect (dùng tracker) ---
+    def connect_to_peer(self, peer_id):
+        info = self.known_peers.get(peer_id)
+        if not info:
+            return False, "Peer not found in tracker"
+
+        try:
+            s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            s.connect((info["ip"], info["port"]))
+            s.sendall(json.dumps({"type": "intro", "peer_id": self.peer_id}).encode() + b"\n")
+            with self.conn_lock:
+                self.connections[peer_id] = s
+            threading.Thread(target=self._peer_reader, args=(peer_id, s), daemon=True).start()
+            self.ws_bridge.push_event({"type": "peer_connected", "peer_id": peer_id})
+            return True, "connected"
+        except Exception as e:
+            return False, str(e)
+
+    # --- outbound connect (manual, không tracker) ---
+    def connect_to_addr(self, ip, port):
+        """
+        Kết nối thẳng tới 1 peer bằng ip/port, không cần tracker.
+        Peer key tạm là "ip:port".
+        """
+        try:
+            s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            s.connect((ip, port))
+            # gửi intro với peer_id của mình
+            s.sendall(json.dumps({"type": "intro", "peer_id": self.peer_id}).encode() + b"\n")
+
+            peer_key = f"{ip}:{port}"
+            with self.conn_lock:
+                self.connections[peer_key] = s
+
+            threading.Thread(target=self._peer_reader, args=(peer_key, s), daemon=True).start()
+            self.ws_bridge.push_event({"type": "peer_connected", "peer_id": peer_key})
+            return True, f"connected to {ip}:{port}"
+        except Exception as e:
+            return False, str(e)
+
+    def _peer_handler(self, conn):
+        """
+        Xử lý kết nối inbound (mình là server, peer kia connect vào).
+        Logic xử lý message sau khi đã intro giống với _peer_reader:
+        - xử lý __meta__ (join room) trước
+        - sau đó mới xử lý msg thường
+        """
+        remote_id = None
+        try:
+            f = conn.makefile("rb")
+            while True:
+                line = f.readline()
+                if not line:
+                    break
+
+                try:
+                    obj = json.loads(line.decode().strip())
+                except Exception:
+                    continue
+
+                # Bước 1: xử lý intro để biết remote_id
+                if obj.get("type") == "intro":
+                    remote_id = obj["peer_id"]
+                    with self.conn_lock:
+                        self.connections[remote_id] = conn
+                    self.ws_bridge.push_event({
+                        "type": "peer_connected",
+                        "peer_id": remote_id
+                    })
+                    continue  # đọc message tiếp theo
+
+                # Bước 2: xử lý meta channel giống _peer_reader
+                ch = obj.get("channel")
+                if ch == "__meta__":
+                    text = obj.get("text", "")
+                    if isinstance(text, str) and text.startswith("join:"):
+                        room = text.split(":", 1)[1]
+                        self.join_channel(room)
+                        self.ws_bridge.push_event({
+                            "type": "joined_channel",
+                            "channel": room,
+                        })
+                    # không đưa __meta__ xuống _handle_incoming_msg
+                    continue
+
+                # Bước 3: message thường
+                if obj.get("type") == "msg":
+                    self._handle_incoming_msg(obj)
+
+        except Exception as e:
+            print("[Peer] _peer_handler error:", e)
+        finally:
+            # nếu biết remote_id thì cleanup connections + báo UI
+            if remote_id is not None:
+                with self.conn_lock:
+                    self.connections.pop(remote_id, None)
+                self.ws_bridge.push_event({
+                    "type": "peer_disconnected",
+                    "peer_id": remote_id
+                })
+            else:
+                try:
+                    conn.close()
+                except Exception:
+                    pass
 
 
-# --- main ---
+    def _peer_reader(self, peer_id, sock):
+        try:
+            f = sock.makefile("rb")
+            while True:
+                line = f.readline()
+                if not line:
+                    break
+                try:
+                    obj = json.loads(line.decode().strip())
+                except Exception:
+                    continue
+
+                # meta channel
+                ch = obj.get("channel")
+                if ch == "__meta__":
+                    text = obj.get("text", "")
+                    if isinstance(text, str) and text.startswith("join:"):
+                        room = text.split(":", 1)[1]
+                        self.join_channel(room)
+                        self.ws_bridge.push_event({
+                            "type": "joined_channel",
+                            "channel": room,
+                        })
+                    continue
+
+                if obj.get("type") == "msg":
+                    self._handle_incoming_msg(obj)
+        except Exception as e:
+            print("[Peer] _peer_reader error:", e)
+        finally:
+            with self.conn_lock:
+                self.connections.pop(peer_id, None)
+            self.ws_bridge.push_event({"type": "peer_disconnected", "peer_id": peer_id})
+
+    def _handle_incoming_msg(self, obj):
+        ch = obj.get("channel", "general")
+
+        # --- Bảo vệ DM: nếu là dm:a:b mà mình không phải a/b => bỏ qua ---
+        if ch.startswith("dm:"):
+            parts = ch.split(":")
+            # format dm:peerA:peerB
+            if len(parts) == 3:
+                allowed = {parts[1], parts[2]}
+                if self.peer_id not in allowed:
+                    print(f"[Peer] ignore DM for others: ch={ch}, me={self.peer_id}")
+                    return
+
+        # auto join nếu chưa có (chỉ cho kênh hợp lệ)
+        if ch not in self.channels:
+            self.join_channel(ch)
+            self.ws_bridge.push_event({"type": "joined_channel", "channel": ch})
+
+        # push ra UI
+        self.ws_bridge.push_event({"type": "msg", "payload": obj})
+
+    # --- broadcast ---
+    def broadcast(self, channel, text):
+        """
+        Gửi message tới các peer đã connect.
+        - "__meta__": luôn gửi cho tất cả (control).
+        - "dm:a:b": chỉ gửi cho đúng 2 peer a, b.
+        - kênh thường: gửi cho tất cả connections.
+        """
+        msg = make_msg(channel, self.peer_id, text)
+        print("[DEBUG] broadcasting:", msg)
+        data = (json.dumps(msg) + "\n").encode()
+
+        with self.conn_lock:
+            peers_snapshot = list(self.connections.items())
+
+        # --- Meta channel: gửi cho tất cả ---
+        if channel == "__meta__":
+            for pid, sock in peers_snapshot:
+                try:
+                    sock.sendall(data)
+                except Exception as e:
+                    print(f"[Peer] meta send to {pid} failed:", e)
+                    with self.conn_lock:
+                        self.connections.pop(pid, None)
+            return
+
+        # --- DM channel: dm:userA:userB -> chỉ gửi cho 2 người đó ---
+        dm_targets = None
+        if channel.startswith("dm:"):
+            parts = channel.split(":")
+            if len(parts) == 3:
+                dm_targets = {parts[1], parts[2]}
+
+        for pid, sock in peers_snapshot:
+            # nếu là DM mà pid không thuộc 2 người, bỏ qua
+            if dm_targets is not None and pid not in dm_targets:
+                continue
+
+            try:
+                sock.sendall(data)
+            except Exception as e:
+                print(f"[Peer] send to {pid} failed:", e)
+                with self.conn_lock:
+                    self.connections.pop(pid, None)
+
+        # echo local cho UI peer gửi
+        self.ws_bridge.push_event({"type": "msg", "payload": msg})
+
+    # --- Gửi meta/message trực tiếp tới 1 peer ---
+    def send_direct(self, peer_id, channel, text):
+        """
+        Gửi 1 message tới đúng peer_id (dùng cho DM/meta như join:room).
+        Trả về (ok, info).
+        """
+        msg = make_msg(channel, self.peer_id, text)
+        data = (json.dumps(msg) + "\n").encode()
+
+        with self.conn_lock:
+            sock = self.connections.get(peer_id)
+
+        if not sock:
+            print(f"[Peer] send_direct: no connection to {peer_id}")
+            return False, "no connection"
+
+        try:
+            sock.sendall(data)
+            return True, "sent"
+        except Exception as e:
+            print(f"[Peer] send_direct to {peer_id} failed: {e}")
+            with self.conn_lock:
+                self.connections.pop(peer_id, None)
+            return False, str(e)
+
+    def join_channel(self, channel):
+        self.channels.add(channel)
+
+    def shutdown(self):
+        self.running = False
+        self.unregister_with_tracker()
+        with self.conn_lock:
+            for sock in self.connections.values():
+                try:
+                    sock.close()
+                except Exception:
+                    pass
+            self.connections.clear()
+
+
+# -----------------------------
+# Static file server (optional)
+# -----------------------------
+def start_static_server(static_port):
+    static_folder = os.path.join(os.getcwd(), "static")
+    os.makedirs(static_folder, exist_ok=True)
+    os.chdir(static_folder)
+    server = ThreadingHTTPServer((STATIC_HOST, static_port), SimpleHTTPRequestHandler)
+    print(f"[HTTP] Static files at http://127.0.0.1:{static_port}/")
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+    return server
+
+
+def register_ws_port_with_cookie_server(peer_id, ws_port):
+    try:
+        requests.post(
+            f"{COOKIE_SERVER}/register_peer_ws",
+            json={"peer_id": peer_id, "ws_port": ws_port},
+            timeout=2,
+        )
+        print(f"[CookieServer] registered ws_port={ws_port} for peer_id={peer_id}")
+    except Exception as e:
+        print("[CookieServer] register_ws_port failed:", e)
+
+
 def main():
-    parser = argparse.ArgumentParser(prog="peer")
-    parser.add_argument("--peer-id", required=True)
-    parser.add_argument("--host", default="0.0.0.0", help="bind host (0.0.0.0 to accept all)")
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--id", default="admin")  # nên trùng username để login mapping đơn giản
+    parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--port", type=int, required=True)
-    parser.add_argument("--tracker", default="http://127.0.0.1:8000")
+    parser.add_argument("--static-port", type=int, default=DEFAULT_STATIC_PORT)
+    parser.add_argument("--ws-port", type=int, default=DEFAULT_WS_PORT)
+
+    # mode cho tracker & cookie & auth
+    parser.add_argument("--no-tracker", action="store_true", help="Disable tracker register/fetch")
+    parser.add_argument("--no-cookie", action="store_true", help="Disable register_ws_port to cookie server")
+    parser.add_argument(
+        "--auth-mode",
+        choices=["strict", "soft", "off"],
+        default="soft",
+        help="WebSocket auth mode with cookie server (/whoami)"
+    )
+
     args = parser.parse_args()
 
-    p = Peer(args.peer_id, args.host, args.port, args.tracker)
-    p.start_listener()
+    # optional static server (có thể không dùng nếu chạy Vite dev)
+    start_static_server(args.static_port)
 
-    # register & fetch
-    if not p.register_to_tracker():
-        logging.warning("initial registration failed; will continue and retry in background")
-    p.fetch_peers()
+    ws = WebSocketBridge(ws_port=args.ws_port, auth_mode=args.auth_mode)
+    peer = Peer(args.id, args.host, args.port, ws)
+    ws.peer_ref = peer
 
-    # re-register background
-    t_rr = threading.Thread(target=p.re_register_loop, name="re-register", daemon=True)
-    t_rr.start()
+    peer.start_server()
+
+    # dùng tracker khi không tắt
+    if not args.no_tracker:
+        peer.register_with_tracker()
+        peer.fetch_peers()
+
+    # đăng ký ws_port với cookie server để /login trả về
+    if not args.no_cookie:
+        register_ws_port_with_cookie_server(peer.peer_id, args.ws_port)
 
     try:
-        repl(p)
-    finally:
-        p.stop()
-        logging.info("peer stopped")
+        while True:
+            time.sleep(1)
+    except KeyboardInterrupt:
+        peer.shutdown()
 
 
 if __name__ == "__main__":

@@ -39,7 +39,6 @@ Peer → Tracker (REST)
 ## 4. Running Instructions
 
 ### Task 1 – HTTP Login System
-
 #### Start Backend
 python start_backend.py --server-ip 127.0.0.1 --server-port 9000
 
@@ -49,33 +48,33 @@ python start_proxy.py --server-ip 127.0.0.1 --server-port 8000
 Access: http://127.0.0.1:8000/login.html
 
 ### Task 2 – Hybrid Chat Application
+#### 1.Start Frontend
+vào apps\weaprous_frontend
+mở cmd chạy lệnh npm run dev
+yêu cầu cài nodejs và chạy lệnh npm install
 
-#### Start Tracker
-python start_sampleapp.py --server-ip 127.0.0.1 --server-port 8000
+#### 2.Start Backend 
+python start_sampleapp.py 
 
-#### Start Peer 1
-python peer_client.py --peer-id P1 --host 127.0.0.1 --port 5001
+#### 3.Start Tracker
+python tracker_server.py 
 
-#### Start Peer 2
-python peer_client.py --peer-id P2 --host 127.0.0.1 --port 5002
+#### 4.Start Peer 1
+python peer_client.py --id admin --host 127.0.0.1 --port 10001 --ws-port 7000 --auth-mode soft
 
-## 5. Example Commands (in peer REPL)
-> peers  
-> send P2 hello  
-> broadcast hi-all  
-> create room1  
-> join room1  
-> sendchan room1 hello-channel  
 
-## 6. Common Errors
+#### 5.Start Peer 2
+python peer_client.py --id user --host 127.0.0.1 --port 10002 --ws-port 7002 --auth-mode soft
+
+
+##Common Errors
 - Address already in use → change port.
 - Peer unreachable → firewall/NAT.
 - TTL expired → auto re-register.
 
-## 7. Conclusion
+## Conclusion
 All requirements for Assignment 1 are completed including:
 - Cookie-based HTTP auth
-- Reverse proxy + backend separation
 - RESTful tracker
 - Direct P2P + fallback relay
 - Channels + broadcast

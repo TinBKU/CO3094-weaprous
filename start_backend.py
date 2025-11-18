@@ -149,32 +149,13 @@ def handle_login(request, response):
         return response.build_unauthorized()
 
 
-@app.route('/api/login', methods=['POST'])
+@app.route('/hello', methods=['PUT'])
 def handle_api_login(request, response):
     """
-    Xử lý login cho API (Task 2), trả về JSON.
+    hello message
     """
-    print(f"[WeApRous] Handling POST /api/login (JSON Response)...")
-    
-    # Lấy data (ưu tiên JSON, sau đó là Form)
-    data = request.json_data
-    if not data:
-        data = request.form_data
-        
-    username = data.get('username')
-    password = data.get('password')
-
-    # Gán request vào response để hàm build_json_response có thể dùng
-    response.request = request 
-
-    if username == 'admin' and password == 'password':
-        # Đăng nhập thành công: Trả về JSON, 200 OK
-        response_body = json.dumps({"ok": True, "message": "Logged in"})
-        return response.build_json_response(response_body, status_code=200)
-    else:
-        # Đăng nhập thất bại: Trả về JSON, 401 Unauthorized
-        response_body = json.dumps({"ok": False, "error": "Unauthorized"})
-        return response.build_json_response(response_body, status_code=401, reason="Unauthorized")
+    body = json.dumps({"hello"})
+    return response.build_json_response(body, status_code=200, reason="OK")
 
 
 
